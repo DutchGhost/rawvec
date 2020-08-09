@@ -16,16 +16,35 @@ pub struct RawVec<T> {
     ptr: NonNull<[MaybeUninit<T>]>,
 }
 
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Failure {
+    CapacityOverflow,
+    Layout,
+    RawAlloc,
+}
+
+#[derive(Debug)]
+pub struct AllocError {
+    kind: Failure,
+    size: usize,
+}
+
+impl AllocError {
+    const fn new(size: usize, kind: Failure) -> Self {
+        Self { size, kind }
+    }
+}
+
 impl<T> RawVec<T> {
     fn layout(capacity: usize) -> Result<Layout, LayoutErr> {
         Layout::array::<MaybeUninit<T>>(capacity)
     }
 
-    unsafe fn raw_alloc(layout: Layout) -> Result<*mut u8, ()> {
+    unsafe fn raw_alloc(layout: Layout) -> Result<*mut u8, AllocError> {
         let ptr = alloc(layout);
 
         if ptr.is_null() {
-            Err(())
+            Err(AllocError::new(layout.size(), Failure::RawAlloc))
         } else {
             Ok(ptr)
         }
@@ -47,30 +66,25 @@ impl<T> RawVec<T> {
         }
     }
 
-    pub fn with_capacity(capacity: usize) -> Result<Self, ()> {
+    pub fn with_capacity(capacity: usize) -> Result<Self, AllocError> {
         if mem::size_of::<T>() == 0 {
             Ok(Self::new())
         } else {
-            let layout = Self::layout(capacity).map_err(drop)?;
+            Self::layout(capacity)
+                .map_err(|_| AllocError::new(capacity, Failure::Layout))
+                .and_then(alloc_guard)
+                .and_then(|layout| unsafe { Self::raw_alloc(layout) })
+                .map(|ptr| unsafe {
+                    let ptr: *mut [MaybeUninit<T>] =
+                        ptr::slice_from_raw_parts_mut(ptr.cast(), capacity);
+                    let ptr = NonNull::new_unchecked(ptr);
 
-            match alloc_guard(layout.size()) {
-                Ok(_) => {}
-                Err(_) => capacity_overflow(),
-            }
-
-            unsafe {
-                let ptr = Self::raw_alloc(layout)?;
-
-                let raw_mut: *mut [MaybeUninit<T>] =
-                    ptr::slice_from_raw_parts_mut(ptr.cast(), capacity);
-                let nonnull = NonNull::new_unchecked(raw_mut);
-
-                Ok(Self { ptr: nonnull })
-            }
+                    Self { ptr }
+                })
         }
     }
-    
-    pub fn try_reserve(&mut self, len: usize, additional: usize) -> Result<(), TryReserveError> {
+
+    pub fn try_reserve(&mut self, len: usize, additional: usize) -> Result<(), AllocError> {
         if self.needs_grow(len, additional) {
             // TODO
             Ok(())
@@ -115,23 +129,6 @@ unsafe impl<#[may_dangle] T> Drop for RawVec<T> {
     }
 }
 
-/// The error type for `try_reserve` methods.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum TryReserveError {
-    /// Error due to the computed capacity exceeding the collection's maximum
-    /// (usually `isize::MAX` bytes).
-    CapacityOverflow,
-
-    /// The memory allocator returned an error
-    AllocError {
-        /// The layout of allocation request that failed
-        layout: Layout,
-
-        #[doc(hidden)]
-        non_exhaustive: (),
-    },
-}
-
 // We need to guarantee the following:
 // * We don't ever allocate `> isize::MAX` byte-size objects.
 // * We don't overflow `usize::MAX` and actually allocate too little.
@@ -141,18 +138,12 @@ pub enum TryReserveError {
 // an extra guard for this in case we're running on a platform which can use
 // all 4GB in user-space, e.g., PAE or x32.
 #[inline]
-fn alloc_guard(alloc_size: usize) -> Result<(), TryReserveError> {
-    if mem::size_of::<usize>() < 8 && alloc_size > isize::MAX as usize {
-        Err(TryReserveError::CapacityOverflow)
+fn alloc_guard(layout: Layout) -> Result<Layout, AllocError> {
+    if mem::size_of::<usize>() < 8 && layout.size() > isize::MAX as usize {
+        Err(AllocError::new(layout.size(), Failure::CapacityOverflow))
     } else {
-        Ok(())
+        Ok(layout)
     }
-}
-// One central function responsible for reporting capacity overflows. This'll
-// ensure that the code generation related to these panics is minimal as there's
-// only one location which panics rather than a bunch throughout the module.
-fn capacity_overflow() -> ! {
-    panic!("capacity overflow");
 }
 
 #[cfg(test)]
